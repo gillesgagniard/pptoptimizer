@@ -63,7 +63,9 @@ type PowerpointDoc struct {
 	slideRels        []Relationships
 	slideLayoutRels  []Relationships
 	slideMasterRels  []Relationships
+	presentationRels Relationships
 	slideMasters     []*etree.Document
+	presentation     *etree.Document
 	contentTypes     Types
 }
 
@@ -104,7 +106,7 @@ func updateSlideMasters(sms []*etree.Document, pos int, sm *etree.Document) []*e
 	return newsms
 }
 
-func getSlideNumberFromFilename(fname string) (int, error) {
+func getObjectNumberFromFilename(fname string) (int, error) {
 	matches := reSlideNumber.FindStringSubmatch(fname)
 	if len(matches) != 2 {
 		return 0, errors.New("invalid file name " + fname)
@@ -116,41 +118,50 @@ func getSlideNumberFromFilename(fname string) (int, error) {
 	return slideNumber, nil
 }
 
-func parseRelationships(rels []Relationships, reltype string, f *zip.File) []Relationships {
+func parseRelationships(f *zip.File) Relationships {
+	relf, err := f.Open()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer relf.Close()
+	relfxml, err := ioutil.ReadAll(relf)
+	if err != nil {
+		log.Fatal(err)
+	}
+	rel := Relationships{}
+	err = xml.Unmarshal(relfxml, &rel)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return rel
+}
+
+func parseAllRelationships(rels []Relationships, reltype string, f *zip.File) []Relationships {
 	if strings.HasPrefix(f.Name, fmt.Sprintf("ppt/%ss/_rels/", reltype)) {
-		relf, err := f.Open()
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer relf.Close()
-		relfxml, err := ioutil.ReadAll(relf)
-		if err != nil {
-			log.Fatal(err)
-		}
-		rel := Relationships{}
-		err = xml.Unmarshal(relfxml, &rel)
-		if err != nil {
-			log.Fatal(err)
-		}
-		slideNumber, _ := getSlideNumberFromFilename(f.Name)
-		rels = updateRelationships(rels, slideNumber, rel)
+		rel := parseRelationships(f)
+		objNumber, _ := getObjectNumberFromFilename(f.Name)
+		rels = updateRelationships(rels, objNumber, rel)
 	}
 	return rels
 }
 
-func saveRelationships(rels []Relationships, reltype string, outz *zip.Writer) {
+func saveRelationships(rel Relationships, relpath string, outz *zip.Writer) {
+	fo, err := outz.Create(relpath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	xmlout, _ := xml.Marshal(rel)
+	fo.Write([]byte(xmlHeader))
+	fo.Write(xmlout)
+}
+
+func saveAllRelationships(rels []Relationships, reltype string, outz *zip.Writer) {
 	for i, r := range rels {
 		if len(r.Relationship) == 0 { // skip empty
 			continue
 		}
-		fo, err := outz.Create(fmt.Sprintf("ppt/%ss/_rels/%s%d.xml.rels", reltype, reltype, i+1))
-		if err != nil {
-			log.Fatal(err)
-		}
-		xmlout, _ := xml.Marshal(r)
 		log.Debugln("new", reltype, "rels", i+1)
-		fo.Write([]byte(xmlHeader))
-		fo.Write(xmlout)
+		saveRelationships(r, fmt.Sprintf("ppt/%ss/_rels/%s%d.xml.rels", reltype, reltype, i+1), outz)
 	}
 }
 
@@ -190,12 +201,25 @@ func (p *PowerpointDoc) ParseFile(f string) error {
 			if _, err := doc.ReadFrom(smf); err != nil {
 				log.Fatal(err)
 			}
-			masterNumber, _ := getSlideNumberFromFilename(f.Name)
+			masterNumber, _ := getObjectNumberFromFilename(f.Name)
 			p.slideMasters = updateSlideMasters(p.slideMasters, masterNumber, doc)
+		} else if f.Name == "ppt/_rels/presentation.xml.rels" {
+			p.presentationRels = parseRelationships(f)
+		} else if f.Name == "ppt/presentation.xml" {
+			pf, err := f.Open()
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer pf.Close()
+			doc := etree.NewDocument()
+			if _, err := doc.ReadFrom(pf); err != nil {
+				log.Fatal(err)
+			}
+			p.presentation = doc
 		} else {
-			p.slideRels = parseRelationships(p.slideRels, "slide", f)
-			p.slideLayoutRels = parseRelationships(p.slideLayoutRels, "slideLayout", f)
-			p.slideMasterRels = parseRelationships(p.slideMasterRels, "slideMaster", f)
+			p.slideRels = parseAllRelationships(p.slideRels, "slide", f)
+			p.slideLayoutRels = parseAllRelationships(p.slideLayoutRels, "slideLayout", f)
+			p.slideMasterRels = parseAllRelationships(p.slideMasterRels, "slideMaster", f)
 		}
 	}
 
@@ -213,24 +237,35 @@ func (p *PowerpointDoc) SaveFile(f string) error {
 	defer outz.Close()
 
 	for _, f := range p.sourceFileReader.File {
-		if f.Name == "[Content_Types].xml" || strings.HasPrefix(f.Name, "ppt/slides/_rels/") || strings.HasPrefix(f.Name, "ppt/slideLayouts/_rels/") || strings.HasPrefix(f.Name, "ppt/slideMasters/") {
-			log.Debugln("skip", f.Name)
-		} else if _, ok := p.medias[f.Name]; strings.HasPrefix(f.Name, "ppt/media/") && !ok {
-			log.Debugln("media", f.Name, "has been removed, skip it")
-		} else {
-			log.Debugln("copy file", f.Name)
-			fi, err := f.Open()
-			if err != nil {
-				log.Fatal(err)
-			}
-			fo, err := outz.Create(f.Name)
-			if err != nil {
-				log.Fatal(err)
-			}
-			idata, _ := ioutil.ReadAll(fi)
-			fo.Write(idata)
-			fi.Close()
+		if f.Name == "[Content_Types].xml" ||
+			strings.HasPrefix(f.Name, "ppt/slides/_rels/") || strings.HasPrefix(f.Name, "ppt/slideLayouts/_rels/") || strings.HasPrefix(f.Name, "ppt/_rels/") ||
+			strings.HasPrefix(f.Name, "ppt/slideMasters/") || f.Name == "ppt/presentation.xml" {
+			log.Debugln("do not copy", f.Name, ", rewrite instead")
+			continue
 		}
+		if _, ok := p.medias[f.Name]; strings.HasPrefix(f.Name, "ppt/media/") && !ok {
+			log.Debugln("media", f.Name, "has been removed, skip it")
+			continue
+		}
+		if strings.HasPrefix(f.Name, "ppt/slideLayouts/") {
+			layoutNumber, _ := getObjectNumberFromFilename(f.Name)
+			if len(p.slideLayoutRels[layoutNumber-1].Relationship) < 1 {
+				log.Debugln("slide layout", f.Name, "has been removed, skip it")
+				continue
+			}
+		}
+		log.Debugln("copy file", f.Name)
+		fi, err := f.Open()
+		if err != nil {
+			log.Fatal(err)
+		}
+		fo, err := outz.Create(f.Name)
+		if err != nil {
+			log.Fatal(err)
+		}
+		idata, _ := ioutil.ReadAll(fi)
+		fo.Write(idata)
+		fi.Close()
 	}
 
 	// add new media files
@@ -245,10 +280,11 @@ func (p *PowerpointDoc) SaveFile(f string) error {
 		}
 	}
 
-	// rewrite all slide rels
-	saveRelationships(p.slideRels, "slide", outz)
-	saveRelationships(p.slideLayoutRels, "slideLayout", outz)
-	saveRelationships(p.slideMasterRels, "slideMaster", outz)
+	// rewrite all rels
+	saveAllRelationships(p.slideRels, "slide", outz)
+	saveAllRelationships(p.slideLayoutRels, "slideLayout", outz)
+	saveAllRelationships(p.slideMasterRels, "slideMaster", outz)
+	saveRelationships(p.presentationRels, "ppt/_rels/presentation.xml.rels", outz)
 
 	// rewrite content types
 	fo, err := outz.Create("[Content_Types].xml")
@@ -261,12 +297,23 @@ func (p *PowerpointDoc) SaveFile(f string) error {
 
 	// rewrite slide masters
 	for i, sm := range p.slideMasters {
+		if sm == nil {
+			log.Debugln("slide master", i+1, "has been removed")
+			continue
+		}
 		fo, err := outz.Create(fmt.Sprintf("ppt/slideMasters/slideMaster%d.xml", i+1))
 		if err != nil {
 			log.Fatal(err)
 		}
 		sm.WriteTo(fo)
 	}
+
+	// rewrite presentation
+	fo, err = outz.Create("ppt/presentation.xml")
+	if err != nil {
+		log.Fatal(err)
+	}
+	p.presentation.WriteTo(fo)
 
 	return nil
 }
@@ -326,12 +373,25 @@ func (p *PowerpointDoc) FindUsedLayouts() []bool {
 	for _, rels := range p.slideRels {
 		for _, rel := range rels.Relationship {
 			if rel.Type == "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" {
-				layoutNumber, _ := getSlideNumberFromFilename(rel.Target)
+				layoutNumber, _ := getObjectNumberFromFilename(rel.Target)
 				usedSlideLayouts[layoutNumber-1] = true
 			}
 		}
 	}
 	return usedSlideLayouts
+}
+
+func (p *PowerpointDoc) FindUsedMasters() []bool {
+	usedSlideMasters := make([]bool, len(p.slideMasterRels))
+	for _, rels := range p.slideLayoutRels {
+		for _, rel := range rels.Relationship {
+			if rel.Type == "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" {
+				masterNumber, _ := getObjectNumberFromFilename(rel.Target)
+				usedSlideMasters[masterNumber-1] = true
+			}
+		}
+	}
+	return usedSlideMasters
 }
 
 func removeLayoutFromMaster(master *etree.Document, id string) {
@@ -363,8 +423,7 @@ func (p *PowerpointDoc) RemoveUnusedLayouts() {
 				for k, relm := range relsm.Relationship {
 					if relm.Target == fmt.Sprintf("../slideLayouts/slideLayout%d.xml", i+1) {
 						layoutid := relm.Id
-						// remove layout reference in slide master itself
-						removeLayoutFromMaster(p.slideMasters[j], layoutid)
+						removeLayoutFromMaster(p.slideMasters[j], layoutid) // remove layout reference in slide master xml
 						copy(p.slideMasterRels[j].Relationship[k:], p.slideMasterRels[j].Relationship[k+1:])
 						p.slideMasterRels[j].Relationship = p.slideMasterRels[j].Relationship[:len(p.slideMasterRels[j].Relationship)-1]
 						break
@@ -374,6 +433,48 @@ func (p *PowerpointDoc) RemoveUnusedLayouts() {
 
 			// remove slide layout itself
 			p.slideLayoutRels[i] = Relationships{}
+		}
+	}
+}
+
+func removeMasterFromPresentation(presentation *etree.Document, id string) {
+	for _, e := range presentation.FindElements(fmt.Sprintf("//p:sldMasterId[@r:id='%s']", id)) {
+		log.Debugln("found master id", id, "in presentation -> remove")
+		if result := e.Parent().RemoveChild(e); result == nil {
+			log.Fatal("cannot remove child !!", *e.Parent(), *e)
+		}
+	}
+}
+
+func (p *PowerpointDoc) RemoveUnusedMasters() {
+	usedSlideMasters := p.FindUsedMasters()
+	for i, b := range usedSlideMasters {
+		if !b { // unused -> remove
+			log.Infoln("remove unused slide master", i+1)
+
+			// remove from content types
+			for j, o := range p.contentTypes.Override {
+				if o.PartName == fmt.Sprintf("/ppt/slideMasters/slideMaster%d.xml", i+1) {
+					copy(p.contentTypes.Override[j:], p.contentTypes.Override[j+1:])
+					p.contentTypes.Override = p.contentTypes.Override[:len(p.contentTypes.Override)-1]
+					break
+				}
+			}
+
+			// remove from presentation
+			for k, relm := range p.presentationRels.Relationship {
+				if relm.Target == fmt.Sprintf("slideMasters/slideMaster%d.xml", i+1) {
+					layoutid := relm.Id
+					removeMasterFromPresentation(p.presentation, layoutid) // remove master reference in presentation xml
+					copy(p.presentationRels.Relationship[k:], p.presentationRels.Relationship[k+1:])
+					p.presentationRels.Relationship = p.presentationRels.Relationship[:len(p.presentationRels.Relationship)-1]
+					break
+				}
+			}
+
+			// remove slide master itself
+			p.slideMasterRels[i] = Relationships{}
+			p.slideMasters[i] = nil
 		}
 	}
 }

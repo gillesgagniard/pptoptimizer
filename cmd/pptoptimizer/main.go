@@ -13,7 +13,7 @@ func main() {
 	flagVerbose := flag.Bool("v", false, "verbose logging")
 	flagInputFile := flag.String("f", "", "pptx input file")
 	flagConvertBitmaps := flag.Bool("convert", true, "convert uncompressed pictures such as TIFF to PNG (lossless)")
-	flagCleanLayouts := flag.Bool("layouts", false, "remove all unused layouts and their media files")
+	flagCleanLayouts := flag.Bool("layouts", false, "remove all unused layouts, masters, and their media files")
 	flagAllOptimizations := flag.Bool("a", false, "apply all optimizations")
 	flag.Parse()
 
@@ -35,6 +35,7 @@ func main() {
 	}
 	if *flagCleanLayouts || *flagAllOptimizations {
 		p.RemoveUnusedLayouts()
+		p.RemoveUnusedMasters()
 		p.RemoveUnusedMedias()
 	}
 

@@ -8,7 +8,8 @@ It doesn't touch your original file and generates a new one, so it should be rea
 ## Features
 
 - Convert TIFF files to PNG (lossless)
-- Remove unused slide layouts
+- Remove unused slide layouts and masters
+- Remove unused associated medias
 
 ## Usage
 
